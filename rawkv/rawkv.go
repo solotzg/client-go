@@ -16,6 +16,9 @@ package rawkv
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
+	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
@@ -54,6 +57,10 @@ type Client struct {
 	rpcClient   rpc.Client
 }
 
+func (c *Client) RegionCache() *locate.RegionCache {
+	return c.regionCache
+}
+
 // NewClient creates a client with PD cluster addrs.
 func NewClient(ctx context.Context, pdAddrs []string, conf config.Config) (*Client, error) {
 	pdCli, err := pd.NewClient(pdAddrs, pd.SecurityOption{
@@ -85,7 +92,7 @@ func (c *Client) ClusterID() uint64 {
 }
 
 // Get queries value with the key. When the key does not exist, it returns `nil, nil`.
-func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
+func (c *Client) GetCf(ctx context.Context, key []byte, cf string) ([]byte, error) {
 	start := time.Now()
 	defer func() { metrics.RawkvCmdHistogram.WithLabelValues("get").Observe(time.Since(start).Seconds()) }()
 
@@ -93,6 +100,7 @@ func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
 		Type: rpc.CmdRawGet,
 		RawGet: &kvrpcpb.RawGetRequest{
 			Key: key,
+			Cf:  cf,
 		},
 	}
 	resp, _, err := c.sendReq(ctx, key, req)
@@ -110,6 +118,10 @@ func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
 		return nil, nil
 	}
 	return cmdResp.Value, nil
+}
+
+func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
+	return c.GetCf(ctx, key, "")
 }
 
 // BatchGet queries values with the keys.
@@ -141,7 +153,7 @@ func (c *Client) BatchGet(ctx context.Context, keys [][]byte) ([][]byte, error) 
 }
 
 // Put stores a key-value pair to TiKV.
-func (c *Client) Put(ctx context.Context, key, value []byte) error {
+func (c *Client) PutCf(ctx context.Context, key, value []byte, cf string) error {
 	start := time.Now()
 	defer func() { metrics.RawkvCmdHistogram.WithLabelValues("put").Observe(time.Since(start).Seconds()) }()
 	metrics.RawkvSizeHistogram.WithLabelValues("key").Observe(float64(len(key)))
@@ -156,6 +168,7 @@ func (c *Client) Put(ctx context.Context, key, value []byte) error {
 		RawPut: &kvrpcpb.RawPutRequest{
 			Key:   key,
 			Value: value,
+			Cf:    cf,
 		},
 	}
 	resp, _, err := c.sendReq(ctx, key, req)
@@ -172,25 +185,184 @@ func (c *Client) Put(ctx context.Context, key, value []byte) error {
 	return nil
 }
 
+const (
+	CopSum uint8 = 1 + iota
+	CopHandleIDs
+	Kill
+)
+
+func (c *Client) GetTableHandleIDs(ctx context.Context, startKey, endKey []byte) ([][]byte, error) {
+	if len(endKey) == 0 {
+		return nil, errors.New("endKey is unlimited")
+	}
+
+	data := make([]byte, 0, 1)
+	data = append(data, byte(CopHandleIDs))
+
+	req := &rpc.Request{
+		Type: rpc.CmdCop,
+		Cop: &coprocessor.Request{
+			Data: data,
+		},
+	}
+
+	res := make([][]byte, 0, 1024)
+
+	for bytes.Compare(startKey, endKey) < 0 {
+		resp, loc, err := c.sendReq(ctx, startKey, req)
+		if err != nil {
+			return nil, err
+		}
+		copResp := resp.Cop
+		if copResp == nil {
+			return nil, errors.WithStack(rpc.ErrBodyMissing)
+		}
+		if copResp.RegionError != nil {
+			return nil, errors.New(copResp.RegionError.String())
+		}
+		num := binary.LittleEndian.Uint64(copResp.Data)
+		data = copResp.Data[8:]
+		for i := uint64(0); i < num; i += 1 {
+			size := binary.LittleEndian.Uint32(data)
+			data = data[4:]
+			res = append(res, data[:size])
+			data = data[size:]
+		}
+		if len(data) != 0 {
+			return nil, errors.New("wrong result while getting all handle ids")
+		}
+		startKey = loc.EndKey
+		if len(startKey) == 0 {
+			break
+		}
+	}
+
+	return res, nil
+}
+
+const magicNumber = 654321
+
+func (c *Client) Kill(ctx context.Context, startKey []byte) error {
+	{
+		bo := retry.NewBackoffer(ctx, retry.RawkvMaxBackoff)
+		loc, err := c.regionCache.LocateKey(bo, startKey)
+		if err != nil {
+			return err
+		}
+		ctx, err := c.regionCache.GetRPCContext(bo, loc.Region)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("send message to kill -9 {store %d, labels %s, address %s} which has leader peer\n", ctx.GetStoreID(), ctx.StoreLabels, ctx.Addr)
+	}
+
+	data := make([]byte, 0, 1)
+	data = append(data, Kill)
+
+	req := &rpc.Request{
+		Type: rpc.CmdCop,
+		Cop: &coprocessor.Request{
+			Data: data,
+		},
+	}
+
+	resp, _, err := c.sendReq(ctx, startKey, req)
+	if err != nil {
+		return err
+	}
+	copResp := resp.Cop
+	if copResp == nil {
+		return errors.WithStack(rpc.ErrBodyMissing)
+	}
+	if copResp.RegionError != nil {
+		return errors.New(copResp.RegionError.String())
+	}
+	if len(copResp.Data) != 8 {
+		return errors.New("illegal magic number format")
+	}
+	tmp := int64(binary.LittleEndian.Uint64(copResp.Data))
+	if tmp != magicNumber {
+		return errors.New(fmt.Sprintf("illegal magic number %d, expect %d", tmp, magicNumber))
+	}
+	return nil
+}
+
+func (c *Client) SumTableCol(ctx context.Context, startKey, endKey []byte, colID int64) (int64, error) {
+
+	if len(endKey) == 0 {
+		return 0, errors.New("endKey is unlimited")
+	}
+
+	data := make([]byte, 0, 9)
+	data = append(data, byte(CopSum))
+
+	var tmp [8]byte
+	binary.LittleEndian.PutUint64(tmp[:], uint64(colID))
+
+	data = append(data, tmp[:]...)
+
+	req := &rpc.Request{
+		Type: rpc.CmdCop,
+		Cop: &coprocessor.Request{
+			Data: data,
+		},
+	}
+
+	sumRes := int64(0)
+
+	for bytes.Compare(startKey, endKey) < 0 {
+		resp, loc, err := c.sendReq(ctx, startKey, req)
+		if err != nil {
+			return 0, err
+		}
+		copResp := resp.Cop
+		if copResp == nil {
+			return 0, errors.WithStack(rpc.ErrBodyMissing)
+		}
+		if copResp.RegionError != nil {
+			return 0, errors.New(copResp.RegionError.String())
+		}
+		sumRes += int64(binary.LittleEndian.Uint64(copResp.Data))
+		startKey = loc.EndKey
+		if len(startKey) == 0 {
+			break
+		}
+	}
+
+	return sumRes, nil
+}
+
+func (c *Client) Put(ctx context.Context, key, value []byte) error {
+	return c.PutCf(ctx, key, value, "")
+}
+
 // BatchPut stores key-value pairs to TiKV.
-func (c *Client) BatchPut(ctx context.Context, keys, values [][]byte) error {
+func (c *Client) BatchPutCf(ctx context.Context, keys, values [][]byte, cf string) error {
 	start := time.Now()
 	defer func() { metrics.RawkvCmdHistogram.WithLabelValues("batch_put").Observe(time.Since(start).Seconds()) }()
 
 	if len(keys) != len(values) {
 		return errors.New("the len of keys is not equal to the len of values")
 	}
+	if len(keys) == 0 {
+		return nil
+	}
+
 	for _, value := range values {
 		if len(value) == 0 {
 			return errors.New("empty value is not supported")
 		}
 	}
 	bo := retry.NewBackoffer(ctx, retry.RawkvMaxBackoff)
-	return c.sendBatchPut(bo, keys, values)
+	return c.sendBatchPut(bo, keys, values, cf)
+}
+
+func (c *Client) BatchPut(ctx context.Context, keys, values [][]byte) error {
+	return c.BatchPutCf(ctx, keys, values, "")
 }
 
 // Delete deletes a key-value pair from TiKV.
-func (c *Client) Delete(ctx context.Context, key []byte) error {
+func (c *Client) DeleteCf(ctx context.Context, key []byte, cf string) error {
 	start := time.Now()
 	defer func() { metrics.RawkvCmdHistogram.WithLabelValues("delete").Observe(time.Since(start).Seconds()) }()
 
@@ -198,6 +370,7 @@ func (c *Client) Delete(ctx context.Context, key []byte) error {
 		Type: rpc.CmdRawDelete,
 		RawDelete: &kvrpcpb.RawDeleteRequest{
 			Key: key,
+			Cf:  cf,
 		},
 	}
 	resp, _, err := c.sendReq(ctx, key, req)
@@ -212,6 +385,10 @@ func (c *Client) Delete(ctx context.Context, key []byte) error {
 		return errors.New(cmdResp.GetError())
 	}
 	return nil
+}
+
+func (c *Client) Delete(ctx context.Context, key []byte) error {
+	return c.DeleteCf(ctx, key, "")
 }
 
 // BatchDelete deletes key-value pairs from TiKV.
@@ -545,7 +722,7 @@ func (c *Client) sendDeleteRangeReq(ctx context.Context, startKey []byte, endKey
 	}
 }
 
-func (c *Client) sendBatchPut(bo *retry.Backoffer, keys, values [][]byte) error {
+func (c *Client) sendBatchPut(bo *retry.Backoffer, keys, values [][]byte, cf string) error {
 	keyToValue := make(map[string][]byte)
 	for i, key := range keys {
 		keyToValue[string(key)] = values[i]
@@ -566,7 +743,7 @@ func (c *Client) sendBatchPut(bo *retry.Backoffer, keys, values [][]byte) error 
 		go func() {
 			singleBatchBackoffer, singleBatchCancel := bo.Fork()
 			defer singleBatchCancel()
-			ch <- c.doBatchPut(singleBatchBackoffer, batch1)
+			ch <- c.doBatchPut(singleBatchBackoffer, batch1, cf)
 		}()
 	}
 
@@ -622,7 +799,7 @@ func appendBatches(batches []batch, regionID locate.RegionVerID, groupKeys [][]b
 	return batches
 }
 
-func (c *Client) doBatchPut(bo *retry.Backoffer, batch batch) error {
+func (c *Client) doBatchPut(bo *retry.Backoffer, batch batch, cf string) error {
 	kvPair := make([]*kvrpcpb.KvPair, 0, len(batch.keys))
 	for i, key := range batch.keys {
 		kvPair = append(kvPair, &kvrpcpb.KvPair{Key: key, Value: batch.values[i]})
@@ -632,6 +809,7 @@ func (c *Client) doBatchPut(bo *retry.Backoffer, batch batch) error {
 		Type: rpc.CmdRawBatchPut,
 		RawBatchPut: &kvrpcpb.RawBatchPutRequest{
 			Pairs: kvPair,
+			Cf:    cf,
 		},
 	}
 
@@ -650,7 +828,7 @@ func (c *Client) doBatchPut(bo *retry.Backoffer, batch batch) error {
 			return err
 		}
 		// recursive call
-		return c.sendBatchPut(bo, batch.keys, batch.values)
+		return c.sendBatchPut(bo, batch.keys, batch.values, cf)
 	}
 
 	cmdResp := resp.RawBatchPut

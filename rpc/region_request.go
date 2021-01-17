@@ -103,7 +103,6 @@ func (s *RegionRequestSender) SendReq(bo *retry.Backoffer, req *Request, regionI
 			return GenRegionErrorResp(req, &errorpb.Error{EpochNotMatch: &errorpb.EpochNotMatch{}})
 		}
 
-		s.storeAddr = ctx.Addr
 		resp, retry, err := s.sendReqToRegion(bo, ctx, req, timeout)
 		if err != nil {
 			return nil, err
@@ -133,7 +132,12 @@ func (s *RegionRequestSender) sendReqToRegion(bo *retry.Backoffer, ctx *locate.R
 	if e := SetContext(req, ctx.Meta, ctx.Peer); e != nil {
 		return nil, false, err
 	}
-	resp, err = s.client.SendRequest(bo.GetContext(), ctx.Addr, req, timeout)
+	addr := ctx.PeerAddr
+	if req.IsReadOnly() {
+		addr = ctx.Addr
+	}
+	//fmt.Printf("try to send request to [region %d] peer [%s] store labels %s \n", ctx.Region.GetID(), ctx.Peer.String(), ctx.StoreLabels)
+	resp, err = s.client.SendRequest(bo.GetContext(), addr, req, timeout)
 	if err != nil {
 		s.rpcError = err
 		if e := s.onSendFail(bo, ctx, err); e != nil {

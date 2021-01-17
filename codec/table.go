@@ -43,6 +43,14 @@ func GenTableRecordPrefix(tableID int64) key.Key {
 	return appendTableRecordPrefix(buf, tableID)
 }
 
+// GenNextTablePrefix composes record prefix with tableID: "t[tableID+1]".
+func GenNextTablePrefix(tableID int64) key.Key {
+	buf := make([]byte, 0, len(tablePrefix)+8)
+	buf = append(buf, tablePrefix...)
+	buf = EncodeInt(buf, tableID+1)
+	return buf
+}
+
 // appendTableIndexPrefix appends table index prefix  "t[tableID]_i".
 func appendTableIndexPrefix(buf []byte, tableID int64) []byte {
 	buf = append(buf, tablePrefix...)
@@ -63,4 +71,12 @@ func EncodeTableIndexPrefix(tableID, idxID int64) key.Key {
 	key = appendTableIndexPrefix(key, tableID)
 	key = EncodeInt(key, idxID)
 	return key
+}
+
+// EncodeTableIndexPrefix encodes index prefix with tableID and idxID.
+func EncodeTableRecordByHandle(tableID, handleID int64) key.Key {
+	res := make([]byte, 0, recordRowKeyLen)
+	res = appendTableRecordPrefix(res, tableID)
+	res = EncodeInt(res, handleID)
+	return res
 }

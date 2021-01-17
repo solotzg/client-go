@@ -74,10 +74,12 @@ func NewRegionCache(pdClient pd.Client, conf *config.RegionCache) *RegionCache {
 
 // RPCContext contains data that is needed to send RPC to a region.
 type RPCContext struct {
-	Region RegionVerID
-	Meta   *metapb.Region
-	Peer   *metapb.Peer
-	Addr   string
+	Region      RegionVerID
+	Meta        *metapb.Region
+	Peer        *metapb.Peer
+	Addr        string
+	PeerAddr    string
+	StoreLabels []*metapb.StoreLabel
 }
 
 // GetStoreID returns StoreID.
@@ -104,7 +106,7 @@ func (c *RegionCache) GetRPCContext(bo *retry.Backoffer, id RegionVerID) (*RPCCo
 	meta, peer := region.meta, region.peer
 	c.mu.RUnlock()
 
-	addr, err := c.GetStoreAddr(bo, peer.GetStoreId())
+	addr, peerAddr, storeLabels, err := c.GetStoreAddr(bo, peer.GetStoreId())
 	if err != nil {
 		return nil, err
 	}
@@ -114,10 +116,12 @@ func (c *RegionCache) GetRPCContext(bo *retry.Backoffer, id RegionVerID) (*RPCCo
 		return nil, nil
 	}
 	return &RPCContext{
-		Region: id,
-		Meta:   meta,
-		Peer:   peer,
-		Addr:   addr,
+		Region:      id,
+		Meta:        meta,
+		Peer:        peer,
+		Addr:        addr,
+		PeerAddr:    peerAddr,
+		StoreLabels: storeLabels,
 	}, nil
 }
 
@@ -395,30 +399,32 @@ func (c *RegionCache) loadRegionByID(bo *retry.Backoffer, regionID uint64) (*Reg
 
 // GetStoreAddr returns a tikv server's address by its storeID. It checks cache
 // first, sends request to pd server when necessary.
-func (c *RegionCache) GetStoreAddr(bo *retry.Backoffer, id uint64) (string, error) {
+func (c *RegionCache) GetStoreAddr(bo *retry.Backoffer, id uint64) (string, string, []*metapb.StoreLabel, error) {
 	c.storeMu.RLock()
 	if store, ok := c.storeMu.stores[id]; ok {
 		c.storeMu.RUnlock()
-		return store.Addr, nil
+		return store.Addr, store.PeerAddr, store.StoreLabels, nil
 	}
 	c.storeMu.RUnlock()
 	return c.ReloadStoreAddr(bo, id)
 }
 
 // ReloadStoreAddr reloads store's address.
-func (c *RegionCache) ReloadStoreAddr(bo *retry.Backoffer, id uint64) (string, error) {
-	addr, err := c.loadStoreAddr(bo, id)
+func (c *RegionCache) ReloadStoreAddr(bo *retry.Backoffer, id uint64) (string, string, []*metapb.StoreLabel, error) {
+	addr, peerAddr, storeLabels, err := c.loadStoreAddr(bo, id)
 	if err != nil || addr == "" {
-		return "", err
+		return "", "", nil, err
 	}
 
 	c.storeMu.Lock()
 	defer c.storeMu.Unlock()
 	c.storeMu.stores[id] = &Store{
-		ID:   id,
-		Addr: addr,
+		ID:          id,
+		Addr:        addr,
+		PeerAddr:    peerAddr,
+		StoreLabels: storeLabels,
 	}
-	return addr, nil
+	return addr, peerAddr, storeLabels, nil
 }
 
 // ClearStoreByID clears store from cache with storeID.
@@ -428,24 +434,28 @@ func (c *RegionCache) ClearStoreByID(id uint64) {
 	delete(c.storeMu.stores, id)
 }
 
-func (c *RegionCache) loadStoreAddr(bo *retry.Backoffer, id uint64) (string, error) {
+func (c *RegionCache) loadStoreAddr(bo *retry.Backoffer, id uint64) (string, string, []*metapb.StoreLabel, error) {
 	for {
 		store, err := c.pdClient.GetStore(bo.GetContext(), id)
 		metrics.RegionCacheCounter.WithLabelValues("get_store", metrics.RetLabel(err)).Inc()
 		if err != nil {
 			if errors.Cause(err) == context.Canceled {
-				return "", err
+				return "", "", nil, err
 			}
 			err = errors.Errorf("loadStore from PD failed, id: %d, err: %v", id, err)
 			if err = bo.Backoff(retry.BoPDRPC, err); err != nil {
-				return "", err
+				return "", "", nil, err
 			}
 			continue
 		}
 		if store == nil {
-			return "", nil
+			return "", "", nil, nil
 		}
-		return store.GetAddress(), nil
+		peerAddr := store.GetPeerAddress()
+		if peerAddr == "" {
+			peerAddr = store.GetAddress()
+		}
+		return store.GetAddress(), peerAddr, store.GetLabels(), nil
 	}
 }
 
@@ -606,6 +616,8 @@ func (r *Region) Contains(key []byte) bool {
 
 // Store contains a tikv server's address.
 type Store struct {
-	ID   uint64
-	Addr string
+	ID          uint64
+	Addr        string
+	PeerAddr    string
+	StoreLabels []*metapb.StoreLabel
 }

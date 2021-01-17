@@ -19,12 +19,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/tikvpb"
+	"github.com/pkg/errors"
 )
 
 // CmdType represents the concrete request type in Request or response type in Response.
@@ -147,6 +147,14 @@ type Request struct {
 	MvccGetByKey       *kvrpcpb.MvccGetByKeyRequest
 	MvccGetByStartTs   *kvrpcpb.MvccGetByStartTsRequest
 	SplitRegion        *kvrpcpb.SplitRegionRequest
+}
+
+func (req *Request) IsReadOnly() bool {
+	switch req.Type {
+	case CmdGet, CmdRawGet, CmdCop:
+		return true
+	}
+	return false
 }
 
 // ToBatchCommandsRequest converts the request to an entry in BatchCommands request.
